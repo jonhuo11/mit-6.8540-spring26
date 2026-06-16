@@ -1,11 +1,13 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -21,8 +23,12 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-var coordSockName string // socket for coordinator
+// avoid collisions on the same filesystem with other mappers potentially retrying
+func generateUniqueIntermediateFilename() string {
+	return ""
+}
 
+var coordSockName string // socket for coordinator
 
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
@@ -32,9 +38,71 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 
+	for {
+		task, err := CallReqTask(&ReqTaskArgs{})
+		if err != nil {
+			// assume the coordinator is done
+			fmt.Printf("coordinator stopped responding, exiting")
+			return
+		}
+
+		switch task.Type { // map or reduce w args
+		case Map:
+			intermediateFiles, err := doMap(mapf, task.MapArgs.File, task.MapArgs.NReduce)
+			if err != nil {
+				continue // just re-loop, the coordinator should auto-detect task failure and retry the task
+			}
+			convIntermediateFiles := make([]IntermediateFile, len(intermediateFiles))
+			for reducerTid, filename := range intermediateFiles {
+				convIntermediateFiles = append(convIntermediateFiles, IntermediateFile{
+					ReducerTid: reducerTid,
+					File:       filename,
+				})
+			}
+			_, err = CallCompleteTask(&CompleteTaskArgs{
+				Type: Map,
+				Tid:  task.Tid,
+				MapOut: struct{ IntermediateFiles []IntermediateFile }{
+					IntermediateFiles: convIntermediateFiles,
+				},
+			})
+			if err != nil {
+				// assume the coordinator is done
+				fmt.Printf("coordinator stopped responding, exiting")
+				return
+			}
+		case Reduce: // TODO: implement this
+		}
+	}
+
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+}
+
+// TODO: implement
+func doMap(mapf func(string, string) []KeyValue, file string, nReduce int) (
+	[]string, // intermediate filenames
+	error,
+) {
+	// create nReduce intermediate files, the i-th will be for the i-th reducer
+	// compute map values
+	// sort values into the nReduce intermediate files
+
+	return nil, nil
+}
+
+func CallReqTask(args *ReqTaskArgs) (*ReqTaskReply, error) {
+	reply := ReqTaskReply{}
+	if ok := call("Coordinator.ReqTask", args, &reply); !ok {
+		return nil, errors.New("")
+	}
+	return &reply, nil
+}
+
+// TODO: implement
+func CallCompleteTask(args *CompleteTaskArgs) (*CompleteTaskReply, error) {
+	return nil, nil
 }
 
 // example function to show how to make an RPC call to the coordinator.

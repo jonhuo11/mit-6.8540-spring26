@@ -6,15 +6,25 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const workerTimeout = 10 * time.Second
+const reqTaskTimeout = 1 * time.Second
 
-type taskEvent struct {
-	attempt int // attempt == mapTask.attempt -> accept
+type mapTask struct {
+	tid               int
+	file              string
+	done              bool
+	intermediateFiles []struct {
+		reducerTid int
+		file       string
+	}
 }
+
+type reduceTask struct{}
 
 type Coordinator struct {
 	// Your definitions here.
@@ -23,13 +33,28 @@ type Coordinator struct {
 	nReduce    int
 	inputFiles []string
 
-	mapAcks        chan taskEvent
-	mapTimeouts    chan taskEvent
-	reduceAcks     chan taskEvent
-	reduceTimeouts chan taskEvent
+	mu sync.Mutex
+	// mapper outputs are deterministic + identical for the same input block, so it doesn't matter who completes the task
+	// the first completion always marks the state as complete, and further completions (from timed out workers replying) are ignored
+	mapTaskStates   []mapTask
+	mapQueue        chan mapTask
+	completionQueue chan CompleteTaskArgs
+	reduceQueue     chan reduceTask
 }
 
 // Your code here -- RPC handlers for the worker to call.
+
+func (c *Coordinator) ReqTask(args *ReqTaskArgs, reply *ReqTaskReply) error {
+	// select a task from the queue
+	// start a timeout goroutine which re-adds the task to the queue after a timeout
+	return nil
+}
+
+func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *CompleteTaskReply) error {
+	c.completionQueue <- args.deepCopy()
+
+	return nil
+}
 
 // an example RPC handler.
 //
@@ -38,22 +63,6 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
-
-/*
-func (c *Coordinator) ReqMap(args *ReqArgs, reply *ReqReply) error {
-
-	func timeout() {
-		time.Sleep(workerTimeout)
-
-	}
-	go timeout()
-}
-
-func (c *Coordinator) AckMap(...) error {
-	// map task is complete
-	defer c.mapAcks <- empty{}
-}
-*/
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server(sockname string) {
@@ -84,6 +93,9 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 	c.done.Store(false)
 	c.nReduce = nReduce
 	c.inputFiles = files
+	c.mapQueue = make(chan mapTask, 128)
+	c.reduceQueue = make(chan reduceTask, 128)
+	c.completionQueue = make(chan CompleteTaskArgs, 128)
 
 	go c.mapReduce()
 
@@ -91,37 +103,55 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 	return &c
 }
 
-// there will be 1 instance of this thread and it will be the only one modifying Coordinator
-// no locks needed, just one atomic on c.done
 func (c *Coordinator) mapReduce() {
-	type mapTask struct {
-		startedAt time.Time // timeout detection
-		attempt   int
-
-		file string
-	}
-
-	type reduceTask struct {
-		startedAt time.Time
-
-		tid uint // range from [0, nReduce)
-	}
-
 	defer c.done.Store(false)
 
 	// spawn one map task per input file
 	nMapTasks := len(c.inputFiles)
-	mapTasks := make([]mapTask, nMapTasks)
 	incompleteMapTasks := nMapTasks
-	for i, inputFile := range c.inputFiles {
-		mapTasks[i].done = false
-		mapTasks[i].file = inputFile
+	for tid, inputFile := range c.inputFiles {
+		c.mapQueue <- mapTask{
+			tid:  tid,
+			file: inputFile,
+			done: false,
+			intermediateFiles: make([]struct {
+				reducerTid int
+				file       string
+			}, c.nReduce, c.nReduce),
+		}
 	}
 	// wait for all map tasks to be claimed and completed with ACKs
+	// even if the map queue is empty we can go
 	for incompleteMapTasks > 0 {
+		taskResult := <-c.completionQueue // TODO: timeout here for total failure if no progress is made after some minutes
+		if taskResult.Type == Map {
+			if taskResult.Tid < 0 || taskResult.Tid >= len(c.mapTaskStates) {
+				continue
+			}
+			if len(taskResult.MapOut.IntermediateFiles) != c.nReduce {
+				return // TODO: requeue the map task, it failed
+			}
 
+			func() {
+				c.mu.Lock()
+				defer c.mu.Unlock()
+
+				tState := &c.mapTaskStates[taskResult.Tid]
+				if tState.done { // enforce exactly-once semantics for completion
+					return
+				}
+				for i, v := range taskResult.MapOut.IntermediateFiles {
+					f := &tState.intermediateFiles[i]
+					f.file = v.File
+					f.reducerTid = v.ReducerTid
+				}
+				tState.done = true
+				incompleteMapTasks--
+			}()
+		} // ignore other types for this phase
 	}
 
 	// spawn nReduce number of reduce tasks
+
 	// wait for all reduce tasks to be claimed and completed with ACKs
 }
