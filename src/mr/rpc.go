@@ -39,7 +39,8 @@ type ReqTaskReply struct {
 		File    string
 		NReduce int // info to help hash
 	}
-	ReduceArgs struct {
+	ReduceArgs struct { // the Tid will be the reducer task
+		Files []string // intermediate files assigned to this reducer
 	}
 }
 

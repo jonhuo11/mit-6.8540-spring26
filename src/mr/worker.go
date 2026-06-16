@@ -1,9 +1,13 @@
 package mr
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
@@ -15,6 +19,8 @@ type KeyValue struct {
 	Value string
 }
 
+type intermediateFileContents map[string][]string
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
 func ihash(key string) int {
@@ -23,9 +29,15 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type randRead func(b []byte) (n int, err error)
+
 // avoid collisions on the same filesystem with other mappers potentially retrying
-func generateUniqueIntermediateFilename() string {
-	return ""
+func generateUniqueIntermediateFilename(mapTid, reduceTid int, randReader randRead) string {
+	b := make([]byte, 16)
+	randReader(b) // err is effectively never non-nil here, but check it in real code
+	randStr := hex.EncodeToString(b)
+
+	return fmt.Sprintf("mr-%v-%v-%v", mapTid, reduceTid, randStr)
 }
 
 var coordSockName string // socket for coordinator
@@ -48,7 +60,12 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 		switch task.Type { // map or reduce w args
 		case Map:
-			intermediateFiles, err := doMap(mapf, task.MapArgs.File, task.MapArgs.NReduce)
+			fileContents, err := readFile(task.MapArgs.File)
+			if err != nil {
+				fmt.Printf("failed to read map input file: %v", err.Error())
+				continue // just re-loop, the coordinator should auto-detect task failure and retry the task
+			}
+			intermediateFiles, err := doMap(mapf, task.MapArgs.File, fileContents, task.Tid, task.MapArgs.NReduce, rand.Read)
 			if err != nil {
 				continue // just re-loop, the coordinator should auto-detect task failure and retry the task
 			}
@@ -71,7 +88,17 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 				fmt.Printf("coordinator stopped responding, exiting")
 				return
 			}
-		case Reduce: // TODO: implement this
+		case Reduce:
+			intermediateFileContents := make([]string, len(task.ReduceArgs.Files))
+			for _, intermediateFilename := range task.ReduceArgs.Files {
+				contents, err := readFile(intermediateFilename)
+				if err != nil {
+					fmt.Printf("failed to read reduce input file: %v", intermediateFilename)
+					continue // just re-loop, the coordinator should auto-detect task failure and retry the task
+				}
+				intermediateFileContents = append(intermediateFileContents, contents)
+			}
+
 		}
 	}
 
@@ -80,16 +107,51 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 }
 
-// TODO: implement
-func doMap(mapf func(string, string) []KeyValue, file string, nReduce int) (
+// fileContents contains the contents of all M intermediate files mapped to this reducer
+func doReduce(reducef func(string, []string) string, fileContents []string) {
+
+}
+
+func doMap(mapf func(string, string) []KeyValue, inputFile, inputContents string, mapTid int, nReduce int, randReader randRead) (
 	[]string, // intermediate filenames
 	error,
 ) {
 	// create nReduce intermediate files, the i-th will be for the i-th reducer
-	// compute map values
-	// sort values into the nReduce intermediate files
+	intermediateFiles := make([]*os.File, nReduce)
+	for reduceTid := range nReduce {
+		fn := generateUniqueIntermediateFilename(mapTid, reduceTid, randReader)
+		f, err := os.Create(fn)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		intermediateFiles[reduceTid] = f
+	}
 
-	return nil, nil
+	// compute map values
+	mapResults := mapf(inputFile, inputContents)
+	// sort values into the nReduce intermediate files
+	sortedResults := map[int]intermediateFileContents{}
+	for i := range nReduce {
+		sortedResults[i] = make(intermediateFileContents)
+	}
+	for _, kv := range mapResults {
+		reduceTid := ihash(kv.Key) % nReduce
+		sortedResults[reduceTid][kv.Key] = append(sortedResults[reduceTid][kv.Key], kv.Value)
+	}
+	// write files as JSON
+	for reduceTid, contentSrc := range sortedResults {
+		content, _ := json.Marshal(contentSrc)
+		_, err := intermediateFiles[reduceTid].Write(content)
+		if err != nil {
+			return nil, err
+		}
+	}
+	intermediateFilenames := make([]string, nReduce)
+	for i, f := range intermediateFiles {
+		intermediateFilenames[i] = f.Name()
+	}
+	return intermediateFilenames, nil
 }
 
 func CallReqTask(args *ReqTaskArgs) (*ReqTaskReply, error) {
@@ -148,4 +210,17 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	}
 	log.Printf("%d: call failed err %v", os.Getpid(), err)
 	return false
+}
+
+func readFile(filename string) (string, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	c, err := io.ReadAll(f)
+	if err != nil {
+		return "", err
+	}
+	return string(c), nil
 }

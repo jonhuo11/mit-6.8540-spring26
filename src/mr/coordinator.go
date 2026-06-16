@@ -117,7 +117,7 @@ func (c *Coordinator) mapReduce() {
 			intermediateFiles: make([]struct {
 				reducerTid int
 				file       string
-			}, c.nReduce, c.nReduce),
+			}, c.nReduce),
 		}
 	}
 	// wait for all map tasks to be claimed and completed with ACKs
