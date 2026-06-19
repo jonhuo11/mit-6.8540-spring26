@@ -53,26 +53,26 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 
 	for {
-		fmt.Println("worker requesting task...")
+		// fmt.Println("worker requesting task...")
 		task, err := CallReqTask(&ReqTaskArgs{})
 		if err != nil {
 			// assume the coordinator is done
-			fmt.Printf("coordinator stopped responding, exiting\n")
+			// fmt.Printf("coordinator stopped responding, exiting\n")
 			return
 		}
-		fmt.Printf("worker recv'd task type %v\n", task.Type)
+		// fmt.Printf("worker recv'd task type %v\n", task.Type)
 
 		switch task.Type { // map or reduce w args
 		case TaskTypeMap:
-			fmt.Printf("worker starting map task %v: %v\n", task.Tid, task.MapArgs.File)
+			// fmt.Printf("worker starting map task %v: %v\n", task.Tid, task.MapArgs.File)
 			fileContents, err := readFile(task.MapArgs.File)
 			if err != nil {
-				fmt.Printf("failed to read map input file %v: %v\n", task.MapArgs.File, err.Error())
+				// fmt.Printf("failed to read map input file %v: %v\n", task.MapArgs.File, err.Error())
 				continue // just re-loop, the coordinator should auto-detect task failure and retry the task
 			}
 			intermediateFiles, err := doMap(mapf, task.MapArgs.File, fileContents, task.Tid, task.MapArgs.NReduce, rand.Read)
 			if err != nil {
-				fmt.Printf("worker failed to execute map task %v: %v\n", task.Tid, err.Error())
+				// fmt.Printf("worker failed to execute map task %v: %v\n", task.Tid, err.Error())
 				continue // just re-loop, the coordinator should auto-detect task failure and retry the task
 			}
 			convIntermediateFiles := []IntermediateFile{}
@@ -91,24 +91,24 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			})
 			if err != nil {
 				// assume the coordinator is done
-				fmt.Printf("coordinator stopped responding, exiting\n")
+				// fmt.Printf("coordinator stopped responding, exiting\n")
 				return
 			}
-			fmt.Printf("worker finished map task %v\n", task.Tid)
+			// fmt.Printf("worker finished map task %v\n", task.Tid)
 		case TaskTypeReduce:
-			fmt.Printf("worker starting reduce task %v, intermediate files: %v\n", task.Tid, task.ReduceArgs.Files)
+			// fmt.Printf("worker starting reduce task %v, intermediate files: %v\n", task.Tid, task.ReduceArgs.Files)
 			intermediateFileContents := []string{}
 			for _, intermediateFilename := range task.ReduceArgs.Files {
 				contents, err := readFile(intermediateFilename)
 				if err != nil {
-					fmt.Printf("failed to read reduce input file: %v\n", intermediateFilename)
+					// fmt.Printf("failed to read reduce input file: %v\n", intermediateFilename)
 					continue // just re-loop, the coordinator should auto-detect task failure and retry the task
 				}
 				intermediateFileContents = append(intermediateFileContents, contents)
 			}
 			err := doReduce(reducef, intermediateFileContents, task.Tid)
 			if err != nil {
-				fmt.Printf("worker failed to execute reduce task %v: %v\n", task.Tid, err.Error())
+				// fmt.Printf("worker failed to execute reduce task %v: %v\n", task.Tid, err.Error())
 				continue
 			}
 
@@ -118,10 +118,10 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 			})
 			if err != nil {
 				// assume the coordinator is done
-				fmt.Printf("coordinator stopped responding, exiting\n")
+				// fmt.Printf("coordinator stopped responding, exiting\n")
 				return
 			}
-			fmt.Printf("worker finished reduce task %v\n", task.Tid)
+			// fmt.Printf("worker finished reduce task %v\n", task.Tid)
 		case TaskTypeSleep:
 			time.Sleep(time.Second * time.Duration(randv2.IntN(5)))
 		}
@@ -140,7 +140,7 @@ func doReduce(reducef func(string, []string) string, fileContents []string, redu
 			reductionMap[k] = append(reductionMap[k], values...)
 		}
 	}
-	fmt.Printf("Reducer %v will process %d keys aggregated over the intermediate files\n", reducerTid, len(reductionMap))
+	// fmt.Printf("Reducer %v will process %d keys aggregated over the intermediate files\n", reducerTid, len(reductionMap))
 	outputFile, err := os.Create(fmt.Sprintf("mr-out-%v", reducerTid))
 	if err != nil {
 		return err
@@ -232,9 +232,9 @@ func CallExample() {
 	ok := call("Coordinator.Example", &args, &reply)
 	if ok {
 		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
+		// fmt.Printf("reply.Y %v\n", reply.Y)
 	} else {
-		fmt.Printf("call failed!\n")
+		// fmt.Printf("call failed!\n")
 	}
 }
 

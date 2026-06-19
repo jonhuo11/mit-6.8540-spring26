@@ -1,7 +1,7 @@
 package mr
 
 import (
-	"fmt"
+	// "fmt"
 	"log"
 	"net"
 	"net/http"
@@ -68,7 +68,7 @@ func (c *Coordinator) ReqTask(args *ReqTaskArgs, reply *ReqTaskReply) error {
 		c.mu.RLock()
 		if t.taskType != c.coordinatorState { // skip, out of sync task
 			c.mu.RUnlock()
-			fmt.Printf("task type mismatch: taskType=%v coordinatorState=%v\n", t.taskType, c.coordinatorState)
+			// fmt.Printf("task type mismatch: taskType=%v coordinatorState=%v\n", t.taskType, c.coordinatorState)
 			reply.Type = TaskTypeSleep
 			return nil
 		}
@@ -90,7 +90,7 @@ func (c *Coordinator) ReqTask(args *ReqTaskArgs, reply *ReqTaskReply) error {
 		default:
 			reply.Type = TaskTypeSleep
 			c.mu.RUnlock()
-			fmt.Printf("unknown task type %v queued by coordinator", t.taskType)
+			// fmt.Printf("unknown task type %v queued by coordinator", t.taskType)
 			return nil
 		}
 		c.mu.RUnlock()
@@ -118,7 +118,7 @@ func (c *Coordinator) ReqTask(args *ReqTaskArgs, reply *ReqTaskReply) error {
 		}()
 		return nil
 	case <-time.After(reqTaskTimeout):
-		fmt.Println("task req timed out")
+		// fmt.Println("task req timed out")
 		reply.Type = TaskTypeSleep
 		return nil
 	}
@@ -205,7 +205,7 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 }
 
 func (c *Coordinator) mapReduce() {
-	fmt.Println("starting map phase...")
+	// fmt.Println("starting map phase...")
 	c.mu.RLock()
 	nMapTasks := len(c.inputFiles)
 	incompleteMapTasks := nMapTasks
@@ -216,7 +216,7 @@ func (c *Coordinator) mapReduce() {
 	// even if the map queue is empty we can go
 	for incompleteMapTasks > 0 {
 		taskResult := <-c.completionQueue // TODO: timeout here for total failure if no progress is made after some minutes
-		fmt.Printf("map task %v completion ACK received\n", taskResult.Tid)
+		// fmt.Printf("map task %v completion ACK received\n", taskResult.Tid)
 		if taskResult.Type != TaskTypeMap {
 			continue
 		}
@@ -224,7 +224,7 @@ func (c *Coordinator) mapReduce() {
 			continue
 		}
 		if len(taskResult.MapOut.IntermediateFiles) != nReduce {
-			fmt.Printf("%v %v", len(taskResult.MapOut.IntermediateFiles), nReduce)
+			// fmt.Printf("%v %v", len(taskResult.MapOut.IntermediateFiles), nReduce)
 			c.taskQueue <- task{
 				tid:      taskResult.Tid,
 				taskType: coordinatorStateMap,
@@ -249,7 +249,7 @@ func (c *Coordinator) mapReduce() {
 			incompleteMapTasks--
 		}()
 
-		fmt.Printf("map task %v completion ACK validated\n", taskResult.Tid)
+		// fmt.Printf("map task %v completion ACK validated\n", taskResult.Tid)
 	}
 
 	// spawn nReduce number of reduce tasks
@@ -268,12 +268,12 @@ func (c *Coordinator) mapReduce() {
 	}
 	c.coordinatorState = coordinatorStateReduce
 	c.mu.Unlock()
-	fmt.Printf("starting reduce phase with %v tasks\n", incompleteReduceTasks)
+	// fmt.Printf("starting reduce phase with %v tasks\n", incompleteReduceTasks)
 
 	// wait for all reduce tasks to be claimed and completed with ACKs
 	for incompleteReduceTasks > 0 {
 		taskResult := <-c.completionQueue // TODO: timeout here for total failure if no progress is made after some minutes
-		fmt.Printf("reduce task %v completion ACK received\n", taskResult.Tid)
+		// fmt.Printf("reduce task %v completion ACK received\n", taskResult.Tid)
 		if taskResult.Type != TaskTypeReduce {
 			continue
 		}
@@ -291,11 +291,11 @@ func (c *Coordinator) mapReduce() {
 			tState.done = true
 			incompleteReduceTasks--
 		}()
-		fmt.Printf("reduce task %v completion ACK validated, final output in %v\n", taskResult.Tid, taskResult.ReduceOut.File)
+		// fmt.Printf("reduce task %v completion ACK validated, final output in %v\n", taskResult.Tid, taskResult.ReduceOut.File)
 	}
 
 	c.mu.Lock()
 	c.coordinatorState = coordinatorStateDone
 	c.mu.Unlock()
-	fmt.Printf("done mapReduce\n")
+	// fmt.Printf("done mapReduce\n")
 }
