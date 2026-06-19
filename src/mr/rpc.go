@@ -24,24 +24,27 @@ type ExampleReply struct {
 type ReqTaskArgs struct {
 }
 
-type TaskType uint
+type TaskType int
 
 const (
-	Map TaskType = iota
-	Reduce
-	QueueEmpty
+	TaskTypeMap    TaskType = 0
+	TaskTypeReduce TaskType = 1
+	TaskTypeSleep  TaskType = 2
 )
 
 type ReqTaskReply struct {
-	Type    TaskType
-	Tid     int
-	MapArgs struct {
-		File    string
-		NReduce int // info to help hash
-	}
-	ReduceArgs struct { // the Tid will be the reducer task
-		Files []string // intermediate files assigned to this reducer
-	}
+	Type       TaskType
+	Tid        int
+	MapArgs    ReqTaskReplyMapArgs
+	ReduceArgs ReqTaskReplyReduceArgs
+}
+
+type ReqTaskReplyMapArgs struct {
+	File    string
+	NReduce int // info to help hash
+}
+type ReqTaskReplyReduceArgs struct { // the Tid will be the reducer task
+	Files []string // intermediate files assigned to this reducer
 }
 
 type IntermediateFile struct {
@@ -56,6 +59,7 @@ type CompleteTaskArgs struct {
 		IntermediateFiles []IntermediateFile // there should be nReduce files, one for each reducer
 	}
 	ReduceOut struct {
+		File string // filename of completed task
 	}
 }
 
