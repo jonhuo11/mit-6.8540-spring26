@@ -1,5 +1,7 @@
 package rpc
 
+// Don't modify this file.
+
 type Err string
 
 const (
