@@ -71,7 +71,8 @@ func MakeKVServer() *KVServer {
 					}
 				} else {
 					op.get.replyChan <- rpc.GetReply{
-						Err: rpc.ErrNoKey,
+						Err:     rpc.ErrNoKey,
+						Version: 0, // for lock Acquire()
 					}
 				}
 			case kvOpTypePut:
