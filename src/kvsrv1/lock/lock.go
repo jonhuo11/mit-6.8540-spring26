@@ -7,6 +7,8 @@ import (
 	kvtest "6.5840/kvtest1"
 )
 
+const emptyLockOwnerId string = ""
+
 type Lock struct {
 	// IKVClerk is a go interface for k/v clerks: the interface hides
 	// the specific Clerk type of ck but promises that ck supports
@@ -35,7 +37,7 @@ func MakeLock(ck kvtest.IKVClerk, lockname string) *Lock {
 func (lk *Lock) Acquire() {
 	// Your code here
 	defer func() {
-		fmt.Println("lock client %v acquired lock %v", lk.id, lk.name)
+		fmt.Printf("lock client %v acquired lock %v\n", lk.id, lk.name)
 	}()
 
 	// spinlock until we acquire it
@@ -43,7 +45,7 @@ func (lk *Lock) Acquire() {
 	for {
 		// get version + owner
 		ownerId, version, err := lk.ck.Get(lk.name)
-		unowned := err == rpc.ErrNoKey || ownerId == ""
+		unowned := err == rpc.ErrNoKey || ownerId == emptyLockOwnerId
 		if !unowned {
 			if ownerId == lk.id {
 				return
@@ -67,19 +69,49 @@ func (lk *Lock) Acquire() {
 			// - thus we need to check ownership
 			ownerId, _, err := lk.ck.Get(lk.name)
 			if err == rpc.ErrNoKey {
-				panic("lock: something fked up the version num")
+				panic(fmt.Sprintf("lock %v: something fked up, lock key was deleted", lk.name))
 			}
 			if ownerId == lk.id {
 				return
 			}
 			continue // spin, we didn't get it
 		case rpc.ErrNoKey: // we fked up the version somehow
-			panic("lock: we fked up the version num")
+			panic(fmt.Sprintf("lock %v: we fked up the version num", lk.name))
 		}
 	}
 }
 
 func (lk *Lock) Release() {
 	// Your code here
-	// TODO:
+
+	defer func() {
+		fmt.Printf("lock client %v released lock %v\n", lk.id, lk.name)
+	}()
+
+	// You must own the lock to release it, not owning = no-op
+	ownerId, version, err := lk.ck.Get(lk.name)
+	unowned := err == rpc.ErrNoKey || ownerId == emptyLockOwnerId
+	if unowned || ownerId != lk.id { // we do not own it, no-op
+		return
+	}
+
+	// put should always be OK as we own the lock, nobody else should be able to modify the version number
+	err = lk.ck.Put(lk.name, emptyLockOwnerId, version)
+	switch err {
+	case rpc.ErrVersion:
+		panic(fmt.Sprintf("lock %v was modified by non-owner or not through Lock somehow", lk.name))
+	case rpc.ErrMaybe:
+		// we either released it or failed to release it
+		// fail to release -> someone else did? panic if so
+		ownerId, _, err := lk.ck.Get(lk.name)
+		if err == rpc.ErrNoKey {
+			panic(fmt.Sprintf("lock %v: something fked up the version num", lk.name))
+		}
+		if ownerId != emptyLockOwnerId {
+			panic(fmt.Sprintf("lock %v was modified by non-owner or not through Lock somehow", lk.name))
+		}
+		// we released it successfully
+	case rpc.ErrNoKey: // we fked up the version somehow in Put
+		panic(fmt.Sprintf("lock %v was modified by non-owner or not through Lock somehow", lk.name))
+	}
 }
