@@ -1,11 +1,18 @@
 package kvsrv
 
 import (
+	"math/rand"
+	"time"
+
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
 )
 
+const (
+	randWaitBaseMs       int = 50
+	randWaitMaxAddedTime     = 150
+)
 
 type Clerk struct {
 	clnt   *tester.Clnt
@@ -16,6 +23,10 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, server: server}
 	// You may add code here.
 	return ck
+}
+
+func RandWait() {
+	time.Sleep(time.Duration(randWaitBaseMs+rand.Intn(randWaitMaxAddedTime+1)) * time.Millisecond) // waits 50-200ms randomly
 }
 
 // Get fetches the current value and version for a key.  It returns
@@ -30,7 +41,23 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
-	return "", 0, rpc.ErrNoKey
+	args := rpc.GetArgs{Key: key}
+	for {
+		reply := rpc.GetReply{}
+		if ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply); !ok {
+			RandWait()
+			continue
+		}
+
+		switch reply.Err {
+		case rpc.OK:
+			return reply.Value, reply.Version, rpc.OK
+		case rpc.ErrNoKey:
+			return "", 0, rpc.ErrNoKey
+		default:
+			RandWait()
+		}
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -52,5 +79,32 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return rpc.ErrNoKey
+	args := rpc.PutArgs{
+		Key:     key,
+		Value:   value,
+		Version: version,
+	}
+
+	var i uint64 = 0
+	for {
+		i += 1
+
+		reply := rpc.PutReply{}
+		if ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply); !ok {
+			RandWait()
+			continue
+		}
+
+		switch reply.Err {
+		case rpc.OK:
+			return rpc.OK
+		case rpc.ErrVersion:
+			if i > 1 {
+				return rpc.ErrMaybe
+			}
+			return rpc.ErrVersion
+		case rpc.ErrNoKey:
+			return rpc.ErrNoKey
+		}
+	}
 }
