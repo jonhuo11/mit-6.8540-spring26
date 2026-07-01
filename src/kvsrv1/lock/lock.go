@@ -3,6 +3,7 @@ package lock
 import (
 	"fmt"
 
+	kvsrv "6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 )
@@ -88,30 +89,37 @@ func (lk *Lock) Release() {
 		fmt.Printf("lock client %v released lock %v\n", lk.id, lk.name)
 	}()
 
-	// You must own the lock to release it, not owning = no-op
-	ownerId, version, err := lk.ck.Get(lk.name)
-	unowned := err == rpc.ErrNoKey || ownerId == emptyLockOwnerId
-	if unowned || ownerId != lk.id { // we do not own it, no-op
-		return
-	}
+	for {
+		// You must own the lock to release it, not owning = no-op
+		ownerId, version, err := lk.ck.Get(lk.name)
+		unowned := err == rpc.ErrNoKey || ownerId == emptyLockOwnerId
+		if unowned || ownerId != lk.id { // we do not own it, no-op
+			return
+		}
 
-	// put should always be OK as we own the lock, nobody else should be able to modify the version number
-	err = lk.ck.Put(lk.name, emptyLockOwnerId, version)
-	switch err {
-	case rpc.ErrVersion:
-		panic(fmt.Sprintf("lock %v was modified by non-owner or not through Lock somehow", lk.name))
-	case rpc.ErrMaybe:
-		// we either released it or failed to release it
-		// fail to release -> someone else did? panic if so
-		ownerId, _, err := lk.ck.Get(lk.name)
-		if err == rpc.ErrNoKey {
-			panic(fmt.Sprintf("lock %v: something fked up the version num", lk.name))
+		// put should always be OK as we own the lock, nobody else should be able to modify the version number
+		err = lk.ck.Put(lk.name, emptyLockOwnerId, version)
+		switch err {
+		case rpc.OK:
+			return
+		case rpc.ErrVersion:
+			panic(fmt.Sprintf("Release ErrVersion: lock %v was modified by non-owner or not through Lock somehow", lk.name))
+		case rpc.ErrMaybe:
+			// we either released it or failed to release it
+			// fail to release -> someone else did? panic if so
+			ownerId, _, err := lk.ck.Get(lk.name)
+			if err == rpc.ErrNoKey {
+				panic(fmt.Sprintf("lock %v: something fked up the version num", lk.name))
+			}
+			if ownerId != emptyLockOwnerId {
+				// retry, possible dropped msg
+				kvsrv.RandWait()
+				continue
+			}
+			// we released it successfully
+			return
+		case rpc.ErrNoKey: // we fked up the version somehow in Put
+			panic(fmt.Sprintf("Release ErrNoKey: lock %v was modified by non-owner or not through Lock somehow", lk.name))
 		}
-		if ownerId != emptyLockOwnerId {
-			panic(fmt.Sprintf("lock %v was modified by non-owner or not through Lock somehow", lk.name))
-		}
-		// we released it successfully
-	case rpc.ErrNoKey: // we fked up the version somehow in Put
-		panic(fmt.Sprintf("lock %v was modified by non-owner or not through Lock somehow", lk.name))
 	}
 }

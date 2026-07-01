@@ -1,9 +1,17 @@
 package kvsrv
 
 import (
+	"math/rand"
+	"time"
+
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
+)
+
+const (
+	randWaitBaseMs       int = 50
+	randWaitMaxAddedTime     = 150
 )
 
 type Clerk struct {
@@ -15,6 +23,10 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, server: server}
 	// You may add code here.
 	return ck
+}
+
+func RandWait() {
+	time.Sleep(time.Duration(randWaitBaseMs+rand.Intn(randWaitMaxAddedTime+1)) * time.Millisecond) // waits 50-200ms randomly
 }
 
 // Get fetches the current value and version for a key.  It returns
@@ -33,6 +45,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	for {
 		reply := rpc.GetReply{}
 		if ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply); !ok {
+			RandWait()
 			continue
 		}
 
@@ -42,7 +55,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		case rpc.ErrNoKey:
 			return "", 0, rpc.ErrNoKey
 		default:
-			continue
+			RandWait()
 		}
 	}
 }
@@ -78,6 +91,7 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 
 		reply := rpc.PutReply{}
 		if ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply); !ok {
+			RandWait()
 			continue
 		}
 
