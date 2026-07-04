@@ -41,9 +41,9 @@ const (
 
 const uncastVote int = -1
 
-type logEntry struct {
-	value string
-	term  uint
+type LogEntry struct {
+	Value string
+	Term  uint
 }
 
 // A Go object implementing a single Raft peer.
@@ -82,7 +82,7 @@ type Raft struct {
 	// persistent
 	currentTerm uint
 	votedFor    int // the candidate ID that received a vote on the current term. -1 if none
-	log         []logEntry
+	log         []LogEntry
 
 	// volatile on followers
 	commitIndex uint // highest known commit index
