@@ -7,9 +7,9 @@ package raft
 // In addition,  Make() creates a new raft peer that implements the
 // raft interface.
 
-
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"time"
@@ -17,12 +17,44 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
+type raftRole = uint8
+
+const (
+	raftRoleLeader raftRole = iota
+	raftRoleFollower
+	raftRoleCandidate
+)
+
+const (
+	// lab limits leader heartbeats to no more than 10 per second
+	minHeartbeatsPerSec float32 = 7
+	maxHeartbeatsPerSec float32 = 9
+
+	// use one that is not >5 seconds or else you will fail to elect a leader
+	minElectionTimeoutPerSec float32 = 0.9
+	maxElectionTimeoutPerSec float32 = 1.1
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
+	/*
+	Jonathan's notes:
+	Can the mutex be unfair, and in a pathological case block the heartbeat/election events?
+
+	sync.Mutex has had a starvation mode since Go 1.9:
+		If a waiter has been blocked for more than 1ms,
+		the mutex switches to direct handoff and waiters are served FIFO.
+		So a goroutine can't be starved indefinitely by barging.
+		Worst case it eats some milliseconds of extra latency under heavy contention
+
+	So no, the lock acquisition is "fair" and the time won't mess things up.
+
+	Raft is designed to be tolerant of timing issues, only requirement is:
+		broadcastTime ≪ electionTimeout ≪ MTBF
+	*/
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *tester.Persister   // Object to hold this peer's persisted state
@@ -32,6 +64,26 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// persistent
+	currentTerm uint
+	votedFor    int // the candidate ID that received a vote on the current term. -1 if none
+	log         []string
+
+	// volatile on followers
+	commitIndex uint // highest known commit index
+	lastApplied uint // actually applied to state machine
+
+	// volatile on leaders (reinitialized after election)
+	nextIndexForFollowers  []uint // index of the next log entry to send to that server (initially leader last log index + 1)
+	matchIndexForFollowers []uint // index of highest log entry we know is replicated on each follower
+
+	// custom state
+	raftRole             raftRole
+	lastHeartbeatRecvdAt time.Time
+}
+
+func (r *Raft) N() int {
+	return len(r.peers)
 }
 
 // return currentTerm and whether this server
@@ -62,7 +114,6 @@ func (rf *Raft) persist() {
 	// rf.persister.Save(raftstate, nil)
 }
 
-
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
@@ -90,7 +141,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -98,24 +148,6 @@ func (rf *Raft) PersistBytes() int {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 
-}
-
-
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (3A).
-}
-
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -150,7 +182,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -169,20 +200,60 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 
-
 	return index, term, isLeader
 }
 
-func (rf *Raft) ticker() {
-	for true {
+func (r *Raft) onHeartbeat() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
+	if r.raftRole != raftRoleLeader { // only leaders send heartbeats
+		return
+	}
+
+
+}
+
+func (r *Raft) onElectionTimeout() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	switch r.raftRole {
+	case raftRoleLeader:
+		// return (election timeouts do not apply to leader)
+	case raftRoleCandidate:
+		// If election timeout elapses, just start a new election
+	case raftRoleFollower:
+		// If election timeout elapses without either:
+		// - receiving AppendEntries RPC from current leader OR
+		// - granting a vote to a candidate
+		// => Convert to candidate
+	default:
+		panic("unknown raft role")
+	}
+}
+
+func calcTpsDelayMs(tps float32) float32 {
+	out := 1000.0 / tps
+	return out
+}
+
+// The tester requires that the leader send heartbeats no more than 10/min
+func ticker(onTicker func(), minTicksPerSecond, maxTicksPerSecond float32) { // election timeout ticker
+	if minTicksPerSecond > maxTicksPerSecond {
+		panic("minTicksPerSecond > maxTicksPerSecond")
+
+	}
+	maxTpsDelayMs := calcTpsDelayMs(minTicksPerSecond)
+	minTpsDelayMs := calcTpsDelayMs(maxTicksPerSecond)
+	delta := maxTpsDelayMs - minTpsDelayMs
+	for {
 		// Your code here (3A)
 		// Check if a leader election should be started.
+		onTicker()
 
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		// pause for a random amount of time between
+		ms := rand.Int63n(int64(delta)) + int64(minTpsDelayMs)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -209,8 +280,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
-
+	// the leader may only send up to 10 heartbeats per sec
+	// you must elect a leader within 5 seconds of past leader failing
+	go ticker(rf.onElectionTimeout, minElectionTimeoutPerSec, maxElectionTimeoutPerSec)
+	
+	// start leader heartbeat ticker
+	go ticker(rf.)
 
 	return rf
 }
