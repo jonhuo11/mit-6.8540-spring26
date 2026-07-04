@@ -31,6 +31,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.raftRole = raftRoleFollower
+	}
+
 	if rf.votedFor != uncastVote {
 		// TODO: once logs are added, the candidate log must be as up to date as the receiver
 		reply.VoteGranted = false

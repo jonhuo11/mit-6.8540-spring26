@@ -69,7 +69,9 @@ type Raft struct {
 	peers []*labrpc.ClientEnd // RPC end points of all peers, never modified so concurrent safe
 
 	// concurrent safe
-	me int // this peer's index into peers[]
+	me  int  // this peer's index into peers[]
+	n   uint // n total servers
+	maj uint // N/2 + 1 if even, otherwise (N+1)/2
 
 	persister *tester.Persister // Object to hold this peer's persisted state
 
@@ -92,21 +94,16 @@ type Raft struct {
 
 	// custom state
 	raftRole     raftRole
-	gotHeartbeat bool
-}
-
-func (r *Raft) N() int {
-	return len(r.peers)
+	gotHeartbeat bool // since the current election timeout started ticking, did we get a heartbeat?
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (3A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return int(rf.currentTerm), rf.raftRole == raftRoleLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -216,7 +213,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-func (r *Raft) onHeartbeat() {
+// This ONLY RUNS ON LEADERs
+func (r *Raft) onHeartbeatTicker() {
 	r.mu.Lock()
 	if r.raftRole != raftRoleLeader { // only leaders send heartbeats
 		r.mu.Unlock()
@@ -231,44 +229,114 @@ func (r *Raft) onHeartbeat() {
 	}
 
 	r.mu.Unlock()
+	r.sendHeartbeatToAllPeers(&args)
+}
 
+// only the leader may call this function
+func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
 	for peerId := range r.peers {
 		reply := AppendEntriesReply{}
-		if ok := r.sendAppendEntries(peerId, &args, &reply); !ok {
+		if ok := r.sendAppendEntries(peerId, args, &reply); !ok {
 			fmt.Printf("leader %v failed to send heartbeat RPC to follower %v\n", r.me, peerId)
 			continue
 		}
 		// are we out of term? => drop to follower, stop
-		r.mu.Lock()
+		r.mu.Lock() // wakeup, check validity of leadership
 		if reply.Term > r.currentTerm {
 			r.raftRole = raftRoleFollower
+			r.gotHeartbeat = true
+			r.mu.Unlock()
+			return
+		}
+		if r.raftRole != raftRoleLeader {
 			r.mu.Unlock()
 			return
 		}
 		r.mu.Unlock()
+
+		// keep sending heartbeats
 	}
 }
 
+/*
+What is an election? As a candidate, you
+1) Increment own term
+2) Vote for self
+3) Reset election timer
+4) Send RequestVote RPCs to all other servers
+5) If votes recv'd from majority of servers, become leader
+*/
 func (r *Raft) onElectionTimeout() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
-	switch r.raftRole {
-	case raftRoleLeader:
-		// return (election timeouts do not apply to leader)
-	case raftRoleCandidate:
-		// If election timeout elapses, just start a new election
-		if !r.gotHeartbeat {
-			r.raftRole = raftRoleCandidate
-		}
-	case raftRoleFollower:
-		// If election timeout elapses without either:
-		// - receiving AppendEntries RPC from current leader OR
-		// - granting a vote to a candidate
-		// => Convert to candidate
-	default:
-		panic("unknown raft role")
+	if r.raftRole == raftRoleLeader {
+		r.mu.Unlock()
+		return
 	}
+
+	if r.raftRole == raftRoleFollower && (r.gotHeartbeat || r.votedFor != uncastVote) {
+		// follower got heartbeat, keep following
+		r.gotHeartbeat = false
+		r.votedFor = uncastVote
+		r.mu.Unlock()
+		return
+	}
+	r.gotHeartbeat = false // reset for next cycle
+
+	// If election timeout elapses without either:
+	// - receiving AppendEntries RPC from current leader (heartbeat) OR
+	// - granting a vote to a candidate
+	// => Convert to candidate
+	// This code also works for existing candidates (starts a new election if the current one timed out)
+	r.raftRole = raftRoleCandidate
+
+	r.currentTerm += 1
+	r.votedFor = r.me
+	var votesRecvdThisTerm uint = 1
+
+	r.mu.Unlock()
+
+	args := RequestVoteArgs{}
+	for peerId := range r.peers {
+		reply := RequestVoteReply{}
+		if ok := r.sendRequestVote(peerId, &args, &reply); !ok {
+			fmt.Printf("candidate %v failed to call RequestVote RPC on peer %v\n", r.me, peerId)
+			continue
+		}
+
+		r.mu.Lock()
+		if reply.Term > r.currentTerm {
+			// drop to follower
+			r.currentTerm = reply.Term
+			r.raftRole = raftRoleFollower
+			r.mu.Unlock()
+			return
+		}
+		if r.raftRole != raftRoleCandidate { // still a candidate? didn't get dropped to follower by some other RPC?
+			r.mu.Unlock()
+			return
+		}
+		if !reply.VoteGranted {
+			r.mu.Unlock()
+			return
+		}
+		votesRecvdThisTerm += 1
+		if votesRecvdThisTerm >= r.maj {
+			// become leader
+			r.raftRole = raftRoleLeader
+			r.votedFor = uncastVote
+			args := AppendEntriesArgs{ // initial empty heartbeat to assert leadership
+				Term:     r.currentTerm,
+				LeaderId: r.me,
+			}
+			r.mu.Unlock()
+			r.sendHeartbeatToAllPeers(&args)
+			return
+		}
+		r.mu.Unlock()
+	}
+
+	// could not gather enough votes, a new election will start next timeout cycle
 }
 
 func calcTpsDelayMs(tps float32) float32 {
@@ -280,7 +348,6 @@ func calcTpsDelayMs(tps float32) float32 {
 func ticker(onTicker func(), minTicksPerSecond, maxTicksPerSecond float32) { // election timeout ticker
 	if minTicksPerSecond > maxTicksPerSecond {
 		panic("minTicksPerSecond > maxTicksPerSecond")
-
 	}
 	maxTpsDelayMs := calcTpsDelayMs(minTicksPerSecond)
 	minTpsDelayMs := calcTpsDelayMs(maxTicksPerSecond)
@@ -311,6 +378,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.n = uint(len(peers))
+	if rf.n%2 == 0 {
+		rf.maj = (rf.n / 2) + 1
+	} else {
+		rf.maj = (rf.n + 1) / 2
+	}
 
 	// Your initialization code here (3A, 3B, 3C).
 
@@ -323,7 +396,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go ticker(rf.onElectionTimeout, minElectionTimeoutPerSec, maxElectionTimeoutPerSec)
 
 	// start leader heartbeat ticker
-	go ticker(rf.onHeartbeat, minHeartbeatsPerSec, maxHeartbeatsPerSec)
+	go ticker(rf.onHeartbeatTicker, minHeartbeatsPerSec, maxHeartbeatsPerSec)
 
 	return rf
 }

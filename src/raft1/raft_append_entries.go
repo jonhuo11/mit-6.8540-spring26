@@ -25,6 +25,8 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 
+	r.gotHeartbeat = true
+
 	if args.Term > r.currentTerm {
 		r.currentTerm = args.Term
 		r.raftRole = raftRoleFollower
