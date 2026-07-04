@@ -12,6 +12,8 @@ import (
 
 	"fmt"
 	"math/rand"
+	"reflect"
+	"runtime"
 	"sync"
 	"time"
 
@@ -259,6 +261,7 @@ func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
 
 		// keep sending heartbeats
 	}
+	fmt.Printf("leader %v successfully finished sending heartbeats to all peers\n", r.me)
 }
 
 /*
@@ -356,11 +359,14 @@ func ticker(onTicker func(), minTicksPerSecond, maxTicksPerSecond float32) { // 
 	if minTicksPerSecond > maxTicksPerSecond {
 		panic("minTicksPerSecond > maxTicksPerSecond")
 	}
-	maxTpsDelayMs := calcTpsDelayMs(maxTicksPerSecond)
-	minTpsDelayMs := calcTpsDelayMs(minTicksPerSecond)
+	onTickerFnName := runtime.FuncForPC(reflect.ValueOf(onTicker).Pointer()).Name()
+	maxTpsDelayMs := calcTpsDelayMs(minTicksPerSecond)
+	minTpsDelayMs := calcTpsDelayMs(maxTicksPerSecond)
 	delta := maxTpsDelayMs - minTpsDelayMs
-
-	fmt.Printf("starting ticker for function %v with bounds of [%v, %v]ms (delta %vms)", minTpsDelayMs, maxTicksPerSecond, delta)
+	fmt.Printf("starting ticker for function %v with bounds of [%v, %v]ms (delta %vms)\n", onTickerFnName, minTpsDelayMs, maxTicksPerSecond, delta)
+	if delta < 0 {
+		panic("delta is negative")
+	}
 	for {
 		// Your code here (3A)
 		// Check if a leader election should be started.
