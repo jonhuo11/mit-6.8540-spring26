@@ -41,19 +41,19 @@ const (
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	/*
-	Jonathan's notes:
-	Can the mutex be unfair, and in a pathological case block the heartbeat/election events?
+		Jonathan's notes:
+		Can the mutex be unfair, and in a pathological case block the heartbeat/election events?
 
-	sync.Mutex has had a starvation mode since Go 1.9:
-		If a waiter has been blocked for more than 1ms,
-		the mutex switches to direct handoff and waiters are served FIFO.
-		So a goroutine can't be starved indefinitely by barging.
-		Worst case it eats some milliseconds of extra latency under heavy contention
+		sync.Mutex has had a starvation mode since Go 1.9:
+			If a waiter has been blocked for more than 1ms,
+			the mutex switches to direct handoff and waiters are served FIFO.
+			So a goroutine can't be starved indefinitely by barging.
+			Worst case it eats some milliseconds of extra latency under heavy contention
 
-	So no, the lock acquisition is "fair" and the time won't mess things up.
+		So no, the lock acquisition is "fair" and the time won't mess things up.
 
-	Raft is designed to be tolerant of timing issues, only requirement is:
-		broadcastTime ≪ electionTimeout ≪ MTBF
+		Raft is designed to be tolerant of timing issues, only requirement is:
+			broadcastTime ≪ electionTimeout ≪ MTBF
 	*/
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -211,7 +211,6 @@ func (r *Raft) onHeartbeat() {
 		return
 	}
 
-
 }
 
 func (r *Raft) onElectionTimeout() {
@@ -283,9 +282,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// the leader may only send up to 10 heartbeats per sec
 	// you must elect a leader within 5 seconds of past leader failing
 	go ticker(rf.onElectionTimeout, minElectionTimeoutPerSec, maxElectionTimeoutPerSec)
-	
+
 	// start leader heartbeat ticker
-	go ticker(rf.)
+	go ticker(rf.onHeartbeat, minHeartbeatsPerSec, maxHeartbeatsPerSec)
 
 	return rf
 }
