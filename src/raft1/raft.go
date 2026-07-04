@@ -10,6 +10,7 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -38,6 +39,13 @@ const (
 	maxElectionTimeoutPerSec float32 = 1.1
 )
 
+const uncastVote int = -1
+
+type logEntry struct {
+	value string
+	term  uint
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	/*
@@ -55,10 +63,15 @@ type Raft struct {
 		Raft is designed to be tolerant of timing issues, only requirement is:
 			broadcastTime ≪ electionTimeout ≪ MTBF
 	*/
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *tester.Persister   // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	mu sync.Mutex // Lock to protect shared access to this peer's state
+
+	// concurrent safe
+	peers []*labrpc.ClientEnd // RPC end points of all peers, never modified so concurrent safe
+
+	// concurrent safe
+	me int // this peer's index into peers[]
+
+	persister *tester.Persister // Object to hold this peer's persisted state
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
@@ -67,7 +80,7 @@ type Raft struct {
 	// persistent
 	currentTerm uint
 	votedFor    int // the candidate ID that received a vote on the current term. -1 if none
-	log         []string
+	log         []logEntry
 
 	// volatile on followers
 	commitIndex uint // highest known commit index
@@ -78,8 +91,8 @@ type Raft struct {
 	matchIndexForFollowers []uint // index of highest log entry we know is replicated on each follower
 
 	// custom state
-	raftRole             raftRole
-	lastHeartbeatRecvdAt time.Time
+	raftRole     raftRole
+	gotHeartbeat bool
 }
 
 func (r *Raft) N() int {
@@ -205,12 +218,35 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (r *Raft) onHeartbeat() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if r.raftRole != raftRoleLeader { // only leaders send heartbeats
+		r.mu.Unlock()
 		return
 	}
 
+	args := AppendEntriesArgs{
+		Term:     r.currentTerm,
+		LeaderId: r.me,
+
+		// TODO: other fields
+	}
+
+	r.mu.Unlock()
+
+	for peerId := range r.peers {
+		reply := AppendEntriesReply{}
+		if ok := r.sendAppendEntries(peerId, &args, &reply); !ok {
+			fmt.Printf("leader %v failed to send heartbeat RPC to follower %v\n", r.me, peerId)
+			continue
+		}
+		// are we out of term? => drop to follower, stop
+		r.mu.Lock()
+		if reply.Term > r.currentTerm {
+			r.raftRole = raftRoleFollower
+			r.mu.Unlock()
+			return
+		}
+		r.mu.Unlock()
+	}
 }
 
 func (r *Raft) onElectionTimeout() {
@@ -222,6 +258,9 @@ func (r *Raft) onElectionTimeout() {
 		// return (election timeouts do not apply to leader)
 	case raftRoleCandidate:
 		// If election timeout elapses, just start a new election
+		if !r.gotHeartbeat {
+			r.raftRole = raftRoleCandidate
+		}
 	case raftRoleFollower:
 		// If election timeout elapses without either:
 		// - receiving AppendEntries RPC from current leader OR
