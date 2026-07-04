@@ -235,6 +235,9 @@ func (r *Raft) onHeartbeatTicker() {
 // only the leader may call this function
 func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
 	for peerId := range r.peers {
+		if peerId == r.me {
+			continue
+		}
 		reply := AppendEntriesReply{}
 		if ok := r.sendAppendEntries(peerId, args, &reply); !ok {
 			fmt.Printf("leader %v failed to send heartbeat RPC to follower %v\n", r.me, peerId)
@@ -298,6 +301,9 @@ func (r *Raft) onElectionTimeout() {
 
 	args := RequestVoteArgs{}
 	for peerId := range r.peers {
+		if peerId == r.me {
+			continue
+		}
 		reply := RequestVoteReply{}
 		if ok := r.sendRequestVote(peerId, &args, &reply); !ok {
 			fmt.Printf("candidate %v failed to call RequestVote RPC on peer %v\n", r.me, peerId)
@@ -323,6 +329,7 @@ func (r *Raft) onElectionTimeout() {
 		votesRecvdThisTerm += 1
 		if votesRecvdThisTerm >= r.maj {
 			// become leader
+			fmt.Printf("node %v has become a leader after winning %v votes!\n", r.me, votesRecvdThisTerm)
 			r.raftRole = raftRoleLeader
 			r.votedFor = uncastVote
 			args := AppendEntriesArgs{ // initial empty heartbeat to assert leadership
@@ -349,9 +356,11 @@ func ticker(onTicker func(), minTicksPerSecond, maxTicksPerSecond float32) { // 
 	if minTicksPerSecond > maxTicksPerSecond {
 		panic("minTicksPerSecond > maxTicksPerSecond")
 	}
-	maxTpsDelayMs := calcTpsDelayMs(minTicksPerSecond)
-	minTpsDelayMs := calcTpsDelayMs(maxTicksPerSecond)
+	maxTpsDelayMs := calcTpsDelayMs(maxTicksPerSecond)
+	minTpsDelayMs := calcTpsDelayMs(minTicksPerSecond)
 	delta := maxTpsDelayMs - minTpsDelayMs
+
+	fmt.Printf("starting ticker for function %v with bounds of [%v, %v]ms (delta %vms)", minTpsDelayMs, maxTicksPerSecond, delta)
 	for {
 		// Your code here (3A)
 		// Check if a leader election should be started.
@@ -378,14 +387,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+
+	// Your initialization code here (3A, 3B, 3C).
 	rf.n = uint(len(peers))
 	if rf.n%2 == 0 {
 		rf.maj = (rf.n / 2) + 1
 	} else {
 		rf.maj = (rf.n + 1) / 2
 	}
-
-	// Your initialization code here (3A, 3B, 3C).
+	rf.raftRole = raftRoleFollower
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
