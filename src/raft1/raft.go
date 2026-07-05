@@ -108,8 +108,9 @@ type Raft struct {
 	matchIndexForFollowers []uint // index of highest log entry we know is replicated on each follower
 
 	// custom state
-	raftRole     raftRole
-	gotHeartbeat bool // since the current election timeout started ticking, did we get a heartbeat?
+	raftRole           raftRole
+	gotHeartbeat       bool // since the current election timeout started ticking, did we get a heartbeat?
+	votesRecvdThisTerm uint
 }
 
 // return currentTerm and whether this server
@@ -254,29 +255,28 @@ func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
 		if peerId == r.me {
 			continue
 		}
-		reply := AppendEntriesReply{}
-		if ok := r.sendAppendEntries(peerId, args, &reply); !ok {
-			fmt.Printf("leader %v failed to send heartbeat RPC to follower %v\n", r.me, peerId)
-			continue
-		}
-		// are we out of term? => drop to follower, stop
-		r.mu.Lock() // wakeup, check validity of leadership
-		if reply.Term > r.currentTerm {
-			fmt.Printf("leader %v was dropped to follower after seeing T%v > T%v\n", r.me, reply.Term, r.currentTerm)
-			r.raftRole = raftRoleFollower
-			r.currentTerm = reply.Term
-			r.gotHeartbeat = true
+		go func() {
+			reply := AppendEntriesReply{}
+			if ok := r.sendAppendEntries(peerId, args, &reply); !ok {
+				fmt.Printf("leader %v failed to send heartbeat RPC to follower %v\n", r.me, peerId)
+				return
+			}
+			// are we out of term? => drop to follower, stop
+			r.mu.Lock() // wakeup, check validity of leadership
+			if reply.Term > r.currentTerm {
+				fmt.Printf("leader %v was dropped to follower after seeing T%v > T%v\n", r.me, reply.Term, r.currentTerm)
+				r.raftRole = raftRoleFollower
+				r.currentTerm = reply.Term
+				r.gotHeartbeat = true
+				r.mu.Unlock()
+				return
+			}
+			if r.raftRole != raftRoleLeader {
+				r.mu.Unlock()
+				return
+			}
 			r.mu.Unlock()
-			return
-		}
-		if r.raftRole != raftRoleLeader {
-			r.mu.Unlock()
-			return
-		}
-		r.mu.Unlock()
-
-		// keep sending heartbeats
-		peersSent++
+		}()
 	}
 	fmt.Printf("leader %v successfully finished sending heartbeats to %v peers (including self)\n", r.me, peersSent)
 }
@@ -315,7 +315,7 @@ func (r *Raft) onElectionTimeout() {
 
 	r.currentTerm += 1
 	r.votedFor = r.me
-	var votesRecvdThisTerm uint = 1
+	r.votesRecvdThisTerm = 1
 
 	args := RequestVoteArgs{
 		Term:        r.currentTerm,
@@ -329,51 +329,50 @@ func (r *Raft) onElectionTimeout() {
 		if peerId == r.me {
 			continue
 		}
-		reply := RequestVoteReply{}
-		if ok := r.sendRequestVote(peerId, &args, &reply); !ok {
-			fmt.Printf("candidate %v failed to call RequestVote RPC on peer %v\n", r.me, peerId)
-			continue
-		}
+		go func() {
+			reply := RequestVoteReply{}
+			if ok := r.sendRequestVote(peerId, &args, &reply); !ok {
+				fmt.Printf("candidate %v failed to call RequestVote RPC on peer %v\n", r.me, peerId)
+				return
+			}
 
-		r.mu.Lock()
-		if reply.Term > r.currentTerm {
-			// drop to follower
-			fmt.Printf("node %v was dropped to follower after seeing T%v > T%v (during vote requesting)\n", r.me, reply.Term, r.currentTerm)
-			r.currentTerm = reply.Term
-			r.raftRole = raftRoleFollower
-			r.gotHeartbeat = true
-			r.mu.Unlock()
-			return
-		}
-		if r.raftRole != raftRoleCandidate { // still a candidate? didn't get dropped to follower by some other RPC?
-			r.mu.Unlock()
-			return
-		}
-		if !reply.VoteGranted {
-			fmt.Printf("candidate %v was denied vote from node %v (now at %v/%v needed)\n", r.me, peerId, votesRecvdThisTerm, r.maj)
-			r.mu.Unlock()
-			continue // check next peer
-		}
-		votesRecvdThisTerm += 1
-		fmt.Printf("node %v has recv'd +1 votes from node %v (now at %v/%v needed)\n", r.me, peerId, votesRecvdThisTerm, r.maj)
-		if votesRecvdThisTerm >= r.maj {
-			// become leader
-			fmt.Printf("node %v has become a leader after winning %v votes!\n", r.me, votesRecvdThisTerm)
-			r.raftRole = raftRoleLeader
-			r.votedFor = uncastVote
-			args := AppendEntriesArgs{ // initial empty heartbeat to assert leadership
-				Term:     r.currentTerm,
-				LeaderId: r.me,
+			r.mu.Lock()
+			if reply.Term > r.currentTerm {
+				// drop to follower
+				fmt.Printf("node %v was dropped to follower after seeing T%v > T%v (during vote requesting)\n", r.me, reply.Term, r.currentTerm)
+				r.currentTerm = reply.Term
+				r.raftRole = raftRoleFollower
+				r.gotHeartbeat = true
+				r.mu.Unlock()
+				return
+			}
+			if r.raftRole != raftRoleCandidate { // still a candidate? didn't get dropped to follower by some other RPC or a sibling call of this goroutine?
+				r.mu.Unlock()
+				return
+			}
+			if !reply.VoteGranted {
+				fmt.Printf("candidate %v was denied vote from node %v (now at %v/%v needed)\n", r.me, peerId, r.votesRecvdThisTerm, r.maj)
+				r.mu.Unlock()
+				return
+			}
+			r.votesRecvdThisTerm += 1
+			fmt.Printf("node %v has recv'd +1 votes from node %v (now at %v/%v needed)\n", r.me, peerId, r.votesRecvdThisTerm, r.maj)
+			if r.votesRecvdThisTerm >= r.maj {
+				// become leader
+				fmt.Printf("node %v has become a leader after winning %v votes!\n", r.me, r.votesRecvdThisTerm)
+				r.raftRole = raftRoleLeader
+				r.votedFor = uncastVote
+				args := AppendEntriesArgs{ // initial empty heartbeat to assert leadership
+					Term:     r.currentTerm,
+					LeaderId: r.me,
+				}
+				r.mu.Unlock()
+				r.sendHeartbeatToAllPeers(&args)
+				return
 			}
 			r.mu.Unlock()
-			r.sendHeartbeatToAllPeers(&args)
-			return
-		}
-		r.mu.Unlock()
+		}()
 	}
-
-	// could not gather enough votes, a new election will start next timeout cycle
-	fmt.Printf("candidate %v could not gather enough votes, waiting for next election cycle\n", r.me)
 }
 
 func calcTpsDelayMs(tps float32) float32 {
