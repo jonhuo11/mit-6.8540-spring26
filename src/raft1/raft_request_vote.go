@@ -46,4 +46,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
+	rf.votedFor = args.CandidateId
+	rf.suppressElection = true // granting a vote to someone suppresses election on this cycle
 }

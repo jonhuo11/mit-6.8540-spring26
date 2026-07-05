@@ -25,7 +25,7 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 
-	r.gotHeartbeat = true
+	r.suppressElection = true
 
 	if args.Term > r.currentTerm {
 		r.currentTerm = args.Term

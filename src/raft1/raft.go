@@ -110,7 +110,7 @@ type Raft struct {
 
 	// custom state
 	raftRole           raftRole
-	gotHeartbeat       bool // since the current election timeout started ticking, did we get a heartbeat?
+	suppressElection   bool // since the current election timeout started ticking, did we get a heartbeat OR grant a vote to someone?
 	votesRecvdThisTerm uint
 }
 
@@ -278,7 +278,7 @@ func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
 				r.raftRole = raftRoleFollower
 				r.currentTerm = reply.Term
 				r.votedFor = uncastVote
-				r.gotHeartbeat = true
+				r.suppressElection = true
 				r.mu.Unlock()
 				return
 			}
@@ -286,6 +286,7 @@ func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
 				r.mu.Unlock()
 				return
 			}
+			peersSent++
 			r.mu.Unlock()
 		}()
 	}
@@ -301,6 +302,7 @@ What is an election? As a candidate, you
 5) If votes recv'd from majority of servers, become leader
 */
 func (r *Raft) onElectionTimeout() {
+	//fmt.Println("election timeout")
 	r.mu.Lock()
 
 	if r.raftRole == raftRoleLeader {
@@ -308,13 +310,13 @@ func (r *Raft) onElectionTimeout() {
 		return
 	}
 
-	if r.raftRole == raftRoleFollower && (r.gotHeartbeat || r.votedFor != uncastVote) {
+	if r.raftRole == raftRoleFollower && r.suppressElection {
 		// follower got heartbeat, keep following
-		r.gotHeartbeat = false
+		r.suppressElection = false
 		r.mu.Unlock()
 		return
 	}
-	r.gotHeartbeat = false // reset for next cycle
+	r.suppressElection = false // reset for next cycle
 
 	// If election timeout elapses without either:
 	// - receiving AppendEntries RPC from current leader (heartbeat) OR
@@ -353,7 +355,7 @@ func (r *Raft) onElectionTimeout() {
 				r.currentTerm = reply.Term
 				r.votedFor = uncastVote
 				r.raftRole = raftRoleFollower
-				r.gotHeartbeat = true
+				r.suppressElection = true
 				r.mu.Unlock()
 				return
 			}
@@ -438,6 +440,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.maj = (rf.n + 1) / 2
 	}
 	rf.raftRole = raftRoleFollower
+	rf.votedFor = uncastVote
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
