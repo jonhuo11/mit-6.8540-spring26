@@ -96,8 +96,9 @@ type Raft struct {
 
 	// persistent
 	currentTerm uint
-	votedFor    int // the candidate ID that received a vote on the current term. -1 if none
-	log         []LogEntry
+	// votedFor is a per term state => each term bump => votedFor reset
+	votedFor int // the candidate ID that received a vote on the current term. -1 if none
+	log      []LogEntry
 
 	// volatile on followers
 	commitIndex uint // highest known commit index
@@ -120,6 +121,15 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return int(rf.currentTerm), rf.raftRole == raftRoleLeader
+}
+
+// caller must hold r.mu
+// Side effects of a term bump
+func (r *Raft) bumpTerm(targetTerm uint) {
+	if r.currentTerm <= targetTerm {
+		panic("you cannot bump to a lteq term")
+	}
+	// TODO: implement
 }
 
 // save Raft's persistent state to stable storage,
@@ -267,6 +277,7 @@ func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
 				fmt.Printf("leader %v was dropped to follower after seeing T%v > T%v\n", r.me, reply.Term, r.currentTerm)
 				r.raftRole = raftRoleFollower
 				r.currentTerm = reply.Term
+				r.votedFor = uncastVote
 				r.gotHeartbeat = true
 				r.mu.Unlock()
 				return
@@ -300,7 +311,6 @@ func (r *Raft) onElectionTimeout() {
 	if r.raftRole == raftRoleFollower && (r.gotHeartbeat || r.votedFor != uncastVote) {
 		// follower got heartbeat, keep following
 		r.gotHeartbeat = false
-		r.votedFor = uncastVote
 		r.mu.Unlock()
 		return
 	}
@@ -341,6 +351,7 @@ func (r *Raft) onElectionTimeout() {
 				// drop to follower
 				fmt.Printf("node %v was dropped to follower after seeing T%v > T%v (during vote requesting)\n", r.me, reply.Term, r.currentTerm)
 				r.currentTerm = reply.Term
+				r.votedFor = uncastVote
 				r.raftRole = raftRoleFollower
 				r.gotHeartbeat = true
 				r.mu.Unlock()
@@ -361,7 +372,6 @@ func (r *Raft) onElectionTimeout() {
 				// become leader
 				fmt.Printf("node %v has become a leader after winning %v votes!\n", r.me, r.votesRecvdThisTerm)
 				r.raftRole = raftRoleLeader
-				r.votedFor = uncastVote
 				args := AppendEntriesArgs{ // initial empty heartbeat to assert leadership
 					Term:     r.currentTerm,
 					LeaderId: r.me,

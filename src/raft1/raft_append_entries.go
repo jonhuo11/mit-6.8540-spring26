@@ -30,6 +30,7 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	if args.Term > r.currentTerm {
 		r.currentTerm = args.Term
 		r.raftRole = raftRoleFollower
+		r.votedFor = uncastVote
 	}
 
 	// TODO: log related stuff
