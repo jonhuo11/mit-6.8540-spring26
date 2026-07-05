@@ -31,14 +31,27 @@ const (
 	raftRoleCandidate
 )
 
+func ppRaftRole(rr raftRole) string {
+	switch rr {
+	case raftRoleLeader:
+		return "Leader"
+	case raftRoleFollower:
+		return "Follower"
+	case raftRoleCandidate:
+		return "Candidate"
+	default:
+		return "Unknown"
+	}
+}
+
 const (
 	// lab limits leader heartbeats to no more than 10 per second
-	minHeartbeatsPerSec float32 = 7
-	maxHeartbeatsPerSec float32 = 9
+	minHeartbeatsPerSec float32 = 9
+	maxHeartbeatsPerSec float32 = 10
 
 	// use one that is not >5 seconds or else you will fail to elect a leader
-	minElectionTimeoutPerSec float32 = 0.9
-	maxElectionTimeoutPerSec float32 = 1.1
+	minElectionTimeoutsPerSec float32 = 2.5
+	maxElectionTimeoutsPerSec float32 = 3
 )
 
 const uncastVote int = -1
@@ -236,6 +249,7 @@ func (r *Raft) onHeartbeatTicker() {
 
 // only the leader may call this function
 func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
+	peersSent := 1 // yourself
 	for peerId := range r.peers {
 		if peerId == r.me {
 			continue
@@ -248,7 +262,9 @@ func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
 		// are we out of term? => drop to follower, stop
 		r.mu.Lock() // wakeup, check validity of leadership
 		if reply.Term > r.currentTerm {
+			fmt.Printf("leader %v was dropped to follower after seeing T%v > T%v\n", r.me, reply.Term, r.currentTerm)
 			r.raftRole = raftRoleFollower
+			r.currentTerm = reply.Term
 			r.gotHeartbeat = true
 			r.mu.Unlock()
 			return
@@ -260,8 +276,9 @@ func (r *Raft) sendHeartbeatToAllPeers(args *AppendEntriesArgs) {
 		r.mu.Unlock()
 
 		// keep sending heartbeats
+		peersSent++
 	}
-	fmt.Printf("leader %v successfully finished sending heartbeats to all peers\n", r.me)
+	fmt.Printf("leader %v successfully finished sending heartbeats to %v peers (including self)\n", r.me, peersSent)
 }
 
 /*
@@ -300,9 +317,14 @@ func (r *Raft) onElectionTimeout() {
 	r.votedFor = r.me
 	var votesRecvdThisTerm uint = 1
 
+	args := RequestVoteArgs{
+		Term:        r.currentTerm,
+		CandidateId: r.me,
+	}
+
+	fmt.Printf("node %v went from %v to %v due to election timeout, starting election for term %v\n", r.me, ppRaftRole(r.raftRole), ppRaftRole(raftRoleCandidate), r.currentTerm)
 	r.mu.Unlock()
 
-	args := RequestVoteArgs{}
 	for peerId := range r.peers {
 		if peerId == r.me {
 			continue
@@ -316,8 +338,10 @@ func (r *Raft) onElectionTimeout() {
 		r.mu.Lock()
 		if reply.Term > r.currentTerm {
 			// drop to follower
+			fmt.Printf("node %v was dropped to follower after seeing T%v > T%v (during vote requesting)\n", r.me, reply.Term, r.currentTerm)
 			r.currentTerm = reply.Term
 			r.raftRole = raftRoleFollower
+			r.gotHeartbeat = true
 			r.mu.Unlock()
 			return
 		}
@@ -326,10 +350,12 @@ func (r *Raft) onElectionTimeout() {
 			return
 		}
 		if !reply.VoteGranted {
+			fmt.Printf("candidate %v was denied vote from node %v (now at %v/%v needed)\n", r.me, peerId, votesRecvdThisTerm, r.maj)
 			r.mu.Unlock()
-			return
+			continue // check next peer
 		}
 		votesRecvdThisTerm += 1
+		fmt.Printf("node %v has recv'd +1 votes from node %v (now at %v/%v needed)\n", r.me, peerId, votesRecvdThisTerm, r.maj)
 		if votesRecvdThisTerm >= r.maj {
 			// become leader
 			fmt.Printf("node %v has become a leader after winning %v votes!\n", r.me, votesRecvdThisTerm)
@@ -347,6 +373,7 @@ func (r *Raft) onElectionTimeout() {
 	}
 
 	// could not gather enough votes, a new election will start next timeout cycle
+	fmt.Printf("candidate %v could not gather enough votes, waiting for next election cycle\n", r.me)
 }
 
 func calcTpsDelayMs(tps float32) float32 {
@@ -363,7 +390,7 @@ func ticker(onTicker func(), minTicksPerSecond, maxTicksPerSecond float32) { // 
 	maxTpsDelayMs := calcTpsDelayMs(minTicksPerSecond)
 	minTpsDelayMs := calcTpsDelayMs(maxTicksPerSecond)
 	delta := maxTpsDelayMs - minTpsDelayMs
-	fmt.Printf("starting ticker for function %v with bounds of [%v, %v]ms (delta %vms)\n", onTickerFnName, minTpsDelayMs, maxTicksPerSecond, delta)
+	fmt.Printf("starting ticker for function %v with bounds of [%v, %v]ms (delta %vms)\n", onTickerFnName, minTpsDelayMs, maxTpsDelayMs, delta)
 	if delta < 0 {
 		panic("delta is negative")
 	}
@@ -409,7 +436,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	// the leader may only send up to 10 heartbeats per sec
 	// you must elect a leader within 5 seconds of past leader failing
-	go ticker(rf.onElectionTimeout, minElectionTimeoutPerSec, maxElectionTimeoutPerSec)
+	go ticker(rf.onElectionTimeout, minElectionTimeoutsPerSec, maxElectionTimeoutsPerSec)
 
 	// start leader heartbeat ticker
 	go ticker(rf.onHeartbeatTicker, minHeartbeatsPerSec, maxHeartbeatsPerSec)

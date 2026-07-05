@@ -34,6 +34,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.raftRole = raftRoleFollower
+		rf.votedFor = uncastVote // we need to fairly re-evaluate this vote request as a follower
 	}
 
 	if rf.votedFor != uncastVote {
