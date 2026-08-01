@@ -1,5 +1,7 @@
 package raft
 
+import "6.5840/raftapi"
+
 type AppendEntriesArgs struct {
 	Term              uint
 	LeaderId          int
@@ -57,6 +59,16 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	r.log = append(r.log[:i], args.Entries[j:]...)
 	if args.LeaderCommitIndex > r.commitIndex {
 		r.commitIndex = min(args.LeaderCommitIndex, uint(len(r.log)-1))
+	}
+
+	// actually apply to state machine
+	for r.commitIndex > r.lastApplied { // leader applying to self
+		r.lastApplied++
+		r.applyCh <- raftapi.ApplyMsg{
+			CommandValid: true,
+			Command:      r.log[r.lastApplied],
+			CommandIndex: int(r.lastApplied),
+		}
 	}
 
 	reply.Success = true
