@@ -372,22 +372,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.mu.Lock()
 
-	index := int(rf.commitIndex)
 	term := int(rf.currentTerm)
 	isLeader := rf.raftRole == raftRoleLeader
 	if !isLeader {
 		rf.mu.Unlock()
-		return index, term, false
+		return -1, term, false
 	}
 	// append to log locally, no guarantee this actually gets committed
 	rf.log = append(rf.log, LogEntry{
 		Value: command,
 		Term:  rf.currentTerm,
 	})
+	landIdx := len(rf.log) - 1
 	rf.mu.Unlock()
 	go agreement()
 
-	return index, term, isLeader
+	return landIdx, term, isLeader
 }
 
 // concurrent unsafe shorthand
@@ -414,24 +414,23 @@ func (r *Raft) onHeartbeatTicker() {
 func (r *Raft) sendHeartbeatToAllPeers() {
 	peersSent := 1 // yourself
 
-	r.mu.Lock()
-	if r.raftRole != raftRoleLeader {
-		r.mu.Unlock()
-		return
-	}
-	args := AppendEntriesArgs{
-		Term:     r.currentTerm,
-		LeaderId: r.me,
-	}
-	r.mu.Unlock()
-
 	for peerId := range r.peers {
 		if peerId == r.me {
 			continue
 		}
 		go func() {
 			reply := AppendEntriesReply{}
-			if ok := r.sendAppendEntries(peerId, &args, &reply); !ok {
+
+			r.mu.Lock()
+			if r.raftRole != raftRoleLeader {
+				r.mu.Unlock()
+				return
+			}
+			args, _, _ := r.constructAppendEntriesArgsForFollower(peerId)
+			args.Entries = nil
+			r.mu.Unlock()
+
+			if ok := r.sendAppendEntries(peerId, args, &reply); !ok {
 				fmt.Printf("leader %v failed to send heartbeat RPC to follower %v\n", r.me, peerId)
 				return
 			}
