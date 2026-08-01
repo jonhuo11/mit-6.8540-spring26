@@ -7,41 +7,136 @@ package raft
 // In addition,  Make() creates a new raft peer that implements the
 // raft interface.
 
-
 import (
 	//	"bytes"
+
+	"fmt"
 	"math/rand"
+	"reflect"
+	"runtime"
+	"slices"
 	"sync"
 	"time"
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
+type raftRole = uint8
+
+const (
+	raftRoleLeader raftRole = iota
+	raftRoleFollower
+	raftRoleCandidate
+)
+
+func ppRaftRole(rr raftRole) string {
+	switch rr {
+	case raftRoleLeader:
+		return "Leader"
+	case raftRoleFollower:
+		return "Follower"
+	case raftRoleCandidate:
+		return "Candidate"
+	default:
+		return "Unknown"
+	}
+}
+
+const (
+	// lab limits leader heartbeats to no more than 10 per second
+	minHeartbeatsPerSec float32 = 9
+	maxHeartbeatsPerSec float32 = 10
+
+	// use one that is not >5 seconds or else you will fail to elect a leader
+	minElectionTimeoutsPerSec float32 = 2.5
+	maxElectionTimeoutsPerSec float32 = 3
+
+	appendEntriesRetryCooldownMs time.Duration = time.Millisecond * 10
+)
+
+const uncastVote int = -1
+
+type LogEntry struct {
+	Value interface{} // command
+	Term  uint
+}
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *tester.Persister   // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	/*
+		Jonathan's notes:
+		Can the mutex be unfair, and in a pathological case block the heartbeat/election events?
+
+		sync.Mutex has had a starvation mode since Go 1.9:
+			If a waiter has been blocked for more than 1ms,
+			the mutex switches to direct handoff and waiters are served FIFO.
+			So a goroutine can't be starved indefinitely by barging.
+			Worst case it eats some milliseconds of extra latency under heavy contention
+
+		So no, the lock acquisition is "fair" and the time won't mess things up.
+
+		Raft is designed to be tolerant of timing issues, only requirement is:
+			broadcastTime ≪ electionTimeout ≪ MTBF
+	*/
+	mu sync.Mutex // Lock to protect shared access to this peer's state
+
+	applyCh chan raftapi.ApplyMsg
+
+	// concurrent safe
+	peers []*labrpc.ClientEnd // RPC end points of all peers, never modified so concurrent safe
+
+	// concurrent safe
+	me  int  // this peer's index into peers[]
+	n   uint // n total servers
+	maj uint // N/2 + 1 if even, otherwise (N+1)/2
+
+	persister *tester.Persister // Object to hold this peer's persisted state
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// persistent
+	currentTerm uint
+	// votedFor is a per term state => each term bump => votedFor reset
+	votedFor int // the candidate ID that received a vote on the current term. -1 if none
+	log      []LogEntry
+
+	// volatile on followers
+
+	commitIndex uint // highest known commit index (the actual truth of the committed state)
+	lastApplied uint // actually applied to state machine
+
+	// volatile on leaders (reinitialized after election)
+
+	nextIndexForFollowers  []int // index of the next log entry to send to that server (initially leader last log index + 1)
+	matchIndexForFollowers []int // index of highest log entry we know is confirmed replicated on each follower
+
+	// custom state
+	raftRole           raftRole
+	suppressElection   bool // since the current election timeout started ticking, did we get a heartbeat OR grant a vote to someone?
+	votesRecvdThisTerm uint
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (3A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return int(rf.currentTerm), rf.raftRole == raftRoleLeader
+}
+
+// caller must hold r.mu
+// Side effects of a term bump
+func (r *Raft) bumpTerm(targetTerm uint) {
+	if r.currentTerm <= targetTerm {
+		panic("you cannot bump to a lteq term")
+	}
+	// TODO: implement
 }
 
 // save Raft's persistent state to stable storage,
@@ -61,7 +156,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -90,7 +184,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -98,24 +191,6 @@ func (rf *Raft) PersistBytes() int {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 
-}
-
-
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (3A).
-}
-
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -150,6 +225,31 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// concurrent unsafe construct args
+// returns: args to send, nextIndex for that follower if success, matchLogIndex for that follower if success
+func (rf *Raft) constructAppendEntriesArgsForFollower(followerIdx int) (*AppendEntriesArgs, int, int) {
+	myLastLogIndex, myLastLog := rf.getLastLog()
+	prevLogIndex := myLastLogIndex
+	prevLogTerm := myLastLog.Term
+	var copiesToSend []LogEntry
+	if myLastLogIndex >= rf.nextIndexForFollowers[followerIdx] {
+		// send logs from [rf.nextIndexForFollowers[followerIdx], myLastLogIndex] over
+		prevLogIndex = rf.nextIndexForFollowers[followerIdx] - 1 // the one before the one we are sending
+		prevLogTerm = rf.log[prevLogIndex].Term
+		copiesToSend = make([]LogEntry, myLastLogIndex-rf.nextIndexForFollowers[followerIdx]+1)
+		copy(copiesToSend, rf.log[rf.nextIndexForFollowers[followerIdx]:myLastLogIndex+1]) // deep copy
+
+	}
+	successNextIndex := rf.nextIndexForFollowers[followerIdx] + len(copiesToSend)
+	return &AppendEntriesArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		PrevLogIndex:      prevLogIndex,
+		PrevLogTerm:       prevLogTerm,
+		Entries:           copiesToSend,
+		LeaderCommitIndex: rf.commitIndex,
+	}, successNextIndex, successNextIndex - 1
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -163,26 +263,323 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (3B).
 
+	/*
+		Paper - on cmd recv from client, after applying to local log
+		1)	For each follower
+			If lastLogIndex >= nextIndexForFollowers[followerIdx] => send AppendEntries starting at nextIndex
+				|-> success	=> update nextIndex and matchIndex
+				|-> fail	=> decrement nextIndexForFollowers[followerIdx] and retry (we think follower is more caught up than it is)
+		2) 	If exists some N where N > commitIndex, majority of matchIndex[i] >= N, and log[N].term == currentTerm => commitIndex = N
+	*/
+	agreement := func() {
+		var wg sync.WaitGroup
+		for followerIdx := range int(rf.n) {
+			if followerIdx == rf.me {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for { // retry w decrementing the nextIndex
+					rf.mu.Lock() // wakeup check
+					if rf.raftRole != raftRoleLeader {
+						rf.mu.Unlock()
+						return
+					}
+					args, successNextIndex, successMatchIndex := rf.constructAppendEntriesArgsForFollower(followerIdx)
+					reply := AppendEntriesReply{}
+					rf.mu.Unlock()
+					if ok := rf.sendAppendEntries(followerIdx, args, &reply); !ok {
+						fmt.Printf("leader %v failed to call sendAppendEntries RPC on peer %v\n", rf.me, followerIdx)
+						return
+					}
 
-	return index, term, isLeader
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm { // wakeup checks
+						fmt.Printf("leader %v was dropped to follower after seeing T%v > T%v\n", rf.me, reply.Term, rf.currentTerm)
+						rf.raftRole = raftRoleFollower
+						rf.currentTerm = reply.Term
+						rf.votedFor = uncastVote
+						rf.suppressElection = true
+						rf.mu.Unlock()
+						return
+					}
+					if rf.raftRole != raftRoleLeader {
+						rf.mu.Unlock()
+						return
+					}
+					if !reply.Success { // decrement, retry
+						if rf.nextIndexForFollowers[followerIdx] == 0 { // a bug
+							rf.mu.Unlock()
+							panic(fmt.Sprintf("leader %v tried to decrement nextIndex for follower %v beyond 0\n", rf.me, followerIdx))
+						}
+						rf.nextIndexForFollowers[followerIdx] -= 1
+						rf.mu.Unlock()
+						time.Sleep(appendEntriesRetryCooldownMs) // cooldown
+						continue
+					}
+					// update nextIndex and matchIndex for that follower
+					rf.nextIndexForFollowers[followerIdx] = successNextIndex
+					rf.matchIndexForFollowers[followerIdx] = successMatchIndex
+
+					rf.mu.Unlock()
+					break
+				}
+			}()
+		}
+		wg.Wait()
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		// its fine if we aren't the leader anymore here, we still wanna apply
+
+		// update the commit index
+		// If exists some N where
+		// N > commitIndex, majority of matchIndex[i] >= N, and log[N].term == currentTerm
+		// 		=> commitIndex = N
+		//
+		// The largest N replicated on a majority is the maj'th largest match index,
+		// so sort descending and read it off directly instead of testing every N.
+		matches := make([]int, 0, rf.n)
+		myLastLogIndex, _ := rf.getLastLog()
+		matches = append(matches, myLastLogIndex) // the leader trivially matches itself
+		for followerIdx := range int(rf.n) {
+			if followerIdx == rf.me {
+				continue
+			}
+			matches = append(matches, rf.matchIndexForFollowers[followerIdx])
+		}
+		slices.SortFunc(matches, func(a, b int) int { return b - a })
+
+		// only entries from the current term may be committed by counting replicas,
+		// older ones are committed indirectly once such an entry commits (paper §5.4.2)
+		n := matches[rf.maj-1]
+		if n > int(rf.commitIndex) && rf.log[n].Term == rf.currentTerm {
+			fmt.Printf("leader %v advanced commitIndex from %v to %v\n", rf.me, rf.commitIndex, n)
+			rf.commitIndex = uint(n)
+		}
+
+		for rf.commitIndex > rf.lastApplied { // applying to self
+			rf.lastApplied++
+			rf.applyCh <- raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Value,
+				CommandIndex: int(rf.lastApplied),
+			}
+		}
+	}
+
+	rf.mu.Lock()
+
+	term := int(rf.currentTerm)
+	isLeader := rf.raftRole == raftRoleLeader
+	if !isLeader {
+		rf.mu.Unlock()
+		return -1, term, false
+	}
+	// append to log locally, no guarantee this actually gets committed
+	rf.log = append(rf.log, LogEntry{
+		Value: command,
+		Term:  rf.currentTerm,
+	})
+	landIdx := len(rf.log) - 1
+	rf.mu.Unlock()
+	go agreement()
+
+	return landIdx, term, isLeader
 }
 
-func (rf *Raft) ticker() {
-	for true {
+// concurrent unsafe shorthand
+// returns (last log index, last LogEntry)
+func (r *Raft) getLastLog() (int, *LogEntry) {
+	if len(r.log) == 0 {
+		return -1, nil
+	}
+	return len(r.log) - 1, &r.log[len(r.log)-1]
+}
 
+// This ONLY RUNS ON LEADERs
+func (r *Raft) onHeartbeatTicker() {
+	r.mu.Lock()
+	if r.raftRole != raftRoleLeader { // only leaders send heartbeats
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+	r.sendHeartbeatToAllPeers()
+}
+
+// only the leader may call this function
+func (r *Raft) sendHeartbeatToAllPeers() {
+	peersSent := 1 // yourself
+
+	for peerId := range r.peers {
+		if peerId == r.me {
+			continue
+		}
+		go func() {
+			reply := AppendEntriesReply{}
+
+			r.mu.Lock()
+			if r.raftRole != raftRoleLeader {
+				r.mu.Unlock()
+				return
+			}
+			args, _, _ := r.constructAppendEntriesArgsForFollower(peerId)
+			args.Entries = nil
+			r.mu.Unlock()
+
+			if ok := r.sendAppendEntries(peerId, args, &reply); !ok {
+				fmt.Printf("leader %v failed to send heartbeat RPC to follower %v\n", r.me, peerId)
+				return
+			}
+			// are we out of term? => drop to follower, stop
+			r.mu.Lock() // wakeup, check validity of leadership
+			if reply.Term > r.currentTerm {
+				fmt.Printf("leader %v was dropped to follower after seeing T%v > T%v\n", r.me, reply.Term, r.currentTerm)
+				r.raftRole = raftRoleFollower
+				r.currentTerm = reply.Term
+				r.votedFor = uncastVote
+				r.suppressElection = true
+				r.mu.Unlock()
+				return
+			}
+			if r.raftRole != raftRoleLeader {
+				r.mu.Unlock()
+				return
+			}
+			peersSent++
+			r.mu.Unlock()
+		}()
+	}
+	fmt.Printf("leader %v successfully finished sending heartbeats to %v peers (including self)\n", r.me, peersSent)
+}
+
+/*
+What is an election? As a candidate, you
+1) Increment own term
+2) Vote for self
+3) Reset election timer
+4) Send RequestVote RPCs to all other servers
+5) If votes recv'd from majority of servers, become leader
+*/
+func (r *Raft) onElectionTimeout() {
+	//fmt.Println("election timeout")
+	r.mu.Lock()
+
+	if r.raftRole == raftRoleLeader {
+		r.mu.Unlock()
+		return
+	}
+
+	if r.raftRole == raftRoleFollower && r.suppressElection {
+		// follower got heartbeat, keep following
+		r.suppressElection = false
+		r.mu.Unlock()
+		return
+	}
+	r.suppressElection = false // reset for next cycle
+
+	// If election timeout elapses without either:
+	// - receiving AppendEntries RPC from current leader (heartbeat) OR
+	// - granting a vote to a candidate
+	// => Convert to candidate
+	// This code also works for existing candidates (starts a new election if the current one timed out)
+	r.raftRole = raftRoleCandidate
+
+	r.currentTerm += 1
+	r.votedFor = r.me
+	r.votesRecvdThisTerm = 1
+
+	args := RequestVoteArgs{
+		Term:        r.currentTerm,
+		CandidateId: r.me,
+	}
+
+	fmt.Printf("node %v went from %v to %v due to election timeout, starting election for term %v\n", r.me, ppRaftRole(r.raftRole), ppRaftRole(raftRoleCandidate), r.currentTerm)
+	r.mu.Unlock()
+
+	for peerId := range r.peers {
+		if peerId == r.me {
+			continue
+		}
+		go func() {
+			reply := RequestVoteReply{}
+			if ok := r.sendRequestVote(peerId, &args, &reply); !ok {
+				fmt.Printf("candidate %v failed to call RequestVote RPC on peer %v\n", r.me, peerId)
+				return
+			}
+
+			r.mu.Lock()
+			if reply.Term > r.currentTerm {
+				// drop to follower
+				fmt.Printf("node %v was dropped to follower after seeing T%v > T%v (during vote requesting)\n", r.me, reply.Term, r.currentTerm)
+				r.currentTerm = reply.Term
+				r.votedFor = uncastVote
+				r.raftRole = raftRoleFollower
+				r.suppressElection = true
+				r.mu.Unlock()
+				return
+			}
+			if r.raftRole != raftRoleCandidate { // still a candidate? didn't get dropped to follower by some other RPC or a sibling call of this goroutine?
+				r.mu.Unlock()
+				return
+			}
+			if !reply.VoteGranted {
+				fmt.Printf("candidate %v was denied vote from node %v (now at %v/%v needed)\n", r.me, peerId, r.votesRecvdThisTerm, r.maj)
+				r.mu.Unlock()
+				return
+			}
+			r.votesRecvdThisTerm += 1
+			fmt.Printf("node %v has recv'd +1 votes from node %v (now at %v/%v needed)\n", r.me, peerId, r.votesRecvdThisTerm, r.maj)
+			if r.votesRecvdThisTerm >= r.maj {
+				// ===== BECOME LEADER =====
+
+				fmt.Printf("node %v has become a leader after winning %v votes!\n", r.me, r.votesRecvdThisTerm)
+				r.raftRole = raftRoleLeader
+				// reset leader volatile state
+				r.nextIndexForFollowers = make([]int, len(r.peers))
+				lastLogIdx, _ := r.getLastLog()
+				for i := range r.nextIndexForFollowers {
+					r.nextIndexForFollowers[i] = lastLogIdx + 1
+				}
+				r.matchIndexForFollowers = make([]int, len(r.peers))
+
+				r.mu.Unlock()
+				r.sendHeartbeatToAllPeers()
+				return
+			}
+			r.mu.Unlock()
+		}()
+	}
+}
+
+func calcTpsDelayMs(tps float32) float32 {
+	out := 1000.0 / tps
+	return out
+}
+
+// The tester requires that the leader send heartbeats no more than 10/min
+func ticker(onTicker func(), minTicksPerSecond, maxTicksPerSecond float32) { // election timeout ticker
+	if minTicksPerSecond > maxTicksPerSecond {
+		panic("minTicksPerSecond > maxTicksPerSecond")
+	}
+	onTickerFnName := runtime.FuncForPC(reflect.ValueOf(onTicker).Pointer()).Name()
+	maxTpsDelayMs := calcTpsDelayMs(minTicksPerSecond)
+	minTpsDelayMs := calcTpsDelayMs(maxTicksPerSecond)
+	delta := maxTpsDelayMs - minTpsDelayMs
+	fmt.Printf("starting ticker for function %v with bounds of [%v, %v]ms (delta %vms)\n", onTickerFnName, minTpsDelayMs, maxTpsDelayMs, delta)
+	if delta < 0 {
+		panic("delta is negative")
+	}
+	for {
 		// Your code here (3A)
 		// Check if a leader election should be started.
+		onTicker()
 
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		// pause for a random amount of time between
+		ms := rand.Int63n(int64(delta)) + int64(minTpsDelayMs)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -202,15 +599,37 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.n = uint(len(peers))
+	if rf.n%2 == 0 {
+		rf.maj = (rf.n / 2) + 1
+	} else {
+		rf.maj = (rf.n + 1) / 2
+	}
+	rf.raftRole = raftRoleFollower
+	rf.votedFor = uncastVote
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.log = append(rf.log, LogEntry{
+		Value: "dummy",
+		Term:  0,
+	})
+
+	rf.currentTerm = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	// the leader may only send up to 10 heartbeats per sec
+	// you must elect a leader within 5 seconds of past leader failing
+	go ticker(rf.onElectionTimeout, minElectionTimeoutsPerSec, maxElectionTimeoutsPerSec)
 
+	// start leader heartbeat ticker
+	go ticker(rf.onHeartbeatTicker, minHeartbeatsPerSec, maxHeartbeatsPerSec)
 
 	return rf
 }
