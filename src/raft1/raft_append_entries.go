@@ -47,18 +47,16 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 	// overwrite the next N
-	i, j := 0, 0
-	for i = args.PrevLogIndex + 1; i < len(r.log); i++ {
-		j = i - (args.PrevLogIndex + 1) // parallel log index in the entries array
-		if r.log[i].Term == args.Entries[j].Term {
+	for i, e := range args.Entries {
+		idx := args.PrevLogIndex + 1 + i
+		if idx < len(r.log) && r.log[idx].Term == e.Term {
 			continue
 		}
-		// this is the divergence point, we overwrite from here with the leader's logs args.Entries[k]
+		r.log = append(r.log[:idx], args.Entries[i:]...)
 		break
 	}
-	r.log = append(r.log[:i], args.Entries[j:]...)
 	if args.LeaderCommitIndex > r.commitIndex {
-		r.commitIndex = min(args.LeaderCommitIndex, uint(len(r.log)-1))
+		r.commitIndex = min(args.LeaderCommitIndex, uint(args.PrevLogIndex+len(args.Entries)))
 	}
 
 	// actually apply to state machine
@@ -66,7 +64,7 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 		r.lastApplied++
 		r.applyCh <- raftapi.ApplyMsg{
 			CommandValid: true,
-			Command:      r.log[r.lastApplied],
+			Command:      r.log[r.lastApplied].Value,
 			CommandIndex: int(r.lastApplied),
 		}
 	}

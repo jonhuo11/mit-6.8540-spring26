@@ -293,7 +293,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					rf.mu.Unlock()
 					if ok := rf.sendAppendEntries(followerIdx, args, &reply); !ok {
 						fmt.Printf("leader %v failed to call sendAppendEntries RPC on peer %v\n", rf.me, followerIdx)
-						rf.mu.Unlock()
 						return
 					}
 
@@ -365,7 +364,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.lastApplied++
 			rf.applyCh <- raftapi.ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.lastApplied],
+				Command:      rf.log[rf.lastApplied].Value,
 				CommandIndex: int(rf.lastApplied),
 			}
 		}
@@ -613,7 +612,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.raftRole = raftRoleFollower
 	rf.votedFor = uncastVote
 
-	rf.commitIndex = 1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.log = append(rf.log, LogEntry{
 		Value: "dummy",
 		Term:  0,
