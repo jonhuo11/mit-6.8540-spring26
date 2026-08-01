@@ -22,7 +22,7 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	if args.Term < r.currentTerm {
 		reply.Term = r.currentTerm
 		reply.Success = false
-		return
+		return // don't listen to a non-leader
 	}
 
 	r.suppressElection = true
@@ -33,7 +33,31 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 		r.votedFor = uncastVote
 	}
 
-	// TODO: log related stuff
+	// ===== log related stuff =====
+	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(r.log) {
+		reply.Success = false
+		return
+	}
+	if r.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		// from the paper: leader will repeatedly decrement the args.prevLogIndex until this does match,
+		// then the next step is to overwrite all logs on the follower from there on with the leader's
+		return
+	}
+	// overwrite the next N
+	i, j := 0, 0
+	for i = args.PrevLogIndex + 1; i < len(r.log); i++ {
+		j = i - (args.PrevLogIndex + 1) // parallel log index in the entries array
+		if r.log[i].Term == args.Entries[j].Term {
+			continue
+		}
+		// this is the divergence point, we overwrite from here with the leader's logs args.Entries[k]
+		break
+	}
+	r.log = append(r.log[:i], args.Entries[j:]...)
+	if args.LeaderCommitIndex > r.commitIndex {
+		r.commitIndex = min(args.LeaderCommitIndex, uint(len(r.log)-1))
+	}
 
 	reply.Success = true
 }
